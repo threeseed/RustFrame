@@ -467,16 +467,21 @@ pub fn initialize() -> anyhow::Result<()> {
     {
         // X11 is available
         info!("[DISPLAY_INFO] X11 display detected: {}", display);
-        // TODO: Use X11 APIs to get actual resolution
-        // For now, use common default
-        (1920, 1080, 1.0)
+        x11rb::connect(None)
+            .ok()
+            .map(|(conn, n)| {
+                use x11rb::connection::Connection;
+                let s = &conn.setup().roots[n];
+                (s.width_in_pixels as u32, s.height_in_pixels as u32, 1.0)
+            })
+            .unwrap_or((1920, 1080, 1.0))
     } else if std::env::var("WAYLAND_DISPLAY").is_ok() {
         // Wayland is available
         info!("[DISPLAY_INFO] Wayland display detected");
         // TODO: Use Wayland APIs to get actual resolution
         (1920, 1080, 1.0)
     } else {
-        warn!("[DISPLAY_INFO] No display server detected, using defaults");
+        log::warn!("[DISPLAY_INFO] No display server detected, using defaults");
         (1920, 1080, 1.0)
     };
 
