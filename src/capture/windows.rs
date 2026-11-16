@@ -9,7 +9,8 @@ use anyhow::{anyhow, Context, Result};
 use log::{debug, info, warn};
 use windows::core::Interface;
 use windows::Graphics::Capture::{
-    Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
+    Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureDirtyRegionMode,
+    GraphicsCaptureItem, GraphicsCaptureSession,
 };
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
@@ -34,7 +35,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DrawIconEx, GetCursorInfo, GetIconInfo, CURSORINFO, DI_NORMAL, ICONINFO,
 };
 
-use super::{CaptureEngine, CaptureFrame};
+use super::{CaptureEngine, CaptureFrame, FrameOptions};
 use crate::capture::CaptureRect;
 use crate::window_filter::WindowIdentifier;
 
@@ -107,7 +108,69 @@ pub struct WindowsGdiCopyCaptureEngine {
     is_active: bool,
     show_cursor: bool,
     excluded_windows: Vec<WindowIdentifier>,
+    /// Memory DC + DIB section reused across frames (recreated on size change)
+    surface: Option<GdiSurface>,
 }
+
+/// Cached GDI destination for BitBlt (avoids CreateDIBSection every frame)
+struct GdiSurface {
+    mem_dc: HDC,
+    bitmap: HBITMAP,
+    old_obj: windows::Win32::Graphics::Gdi::HGDIOBJ,
+    bits: *mut std::ffi::c_void,
+    width: u32,
+    height: u32,
+}
+
+impl GdiSurface {
+    unsafe fn new(screen_dc: HDC, width: u32, height: u32) -> Option<Self> {
+        let mem_dc = CreateCompatibleDC(Some(screen_dc));
+        if mem_dc.is_invalid() {
+            return None;
+        }
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width as i32,
+                biHeight: -(height as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+        let bitmap = match CreateDIBSection(Some(mem_dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) {
+            Ok(b) if !bits.is_null() => b,
+            Ok(b) => {
+                let _ = DeleteObject(b.into());
+                let _ = DeleteDC(mem_dc);
+                return None;
+            }
+            Err(_) => {
+                let _ = DeleteDC(mem_dc);
+                return None;
+            }
+        };
+        let old_obj = SelectObject(mem_dc, bitmap.into());
+        Some(Self { mem_dc, bitmap, old_obj, bits, width, height })
+    }
+}
+
+impl Drop for GdiSurface {
+    fn drop(&mut self) {
+        unsafe {
+            SelectObject(self.mem_dc, self.old_obj);
+            let _ = DeleteObject(self.bitmap.into());
+            let _ = DeleteDC(self.mem_dc);
+        }
+    }
+}
+
+// SAFETY: GDI memory DCs/bitmaps are process-wide handles; the engine is only
+// used from one thread at a time (guarded by the capture engine mutex).
+unsafe impl Send for WindowsGdiCopyCaptureEngine {}
 
 impl WindowsGdiCopyCaptureEngine {
     pub fn new() -> Result<Self> {
@@ -116,6 +179,7 @@ impl WindowsGdiCopyCaptureEngine {
             is_active: false,
             show_cursor: true,
             excluded_windows: Vec::new(),
+            surface: None,
         })
     }
 
@@ -238,6 +302,7 @@ impl CaptureEngine for WindowsGdiCopyCaptureEngine {
     fn stop(&mut self) {
         self.is_active = false;
         self.capture_region = None;
+        self.surface = None;
     }
 
     fn is_active(&self) -> bool {
@@ -265,44 +330,23 @@ impl CaptureEngine for WindowsGdiCopyCaptureEngine {
                 return None;
             }
 
-            let mem_dc = CreateCompatibleDC(Some(screen_dc));
-            if mem_dc.is_invalid() {
+            if self
+                .surface
+                .as_ref()
+                .map_or(true, |s| s.width != width || s.height != height)
+            {
+                self.surface = None; // release old before allocating new
+                self.surface = GdiSurface::new(screen_dc, width, height);
+            }
+            let Some(surface) = self.surface.as_ref() else {
                 let _ = ReleaseDC(None, screen_dc);
                 return None;
-            }
-
-            let bmi = BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER {
-                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: width as i32,
-                    biHeight: -(height as i32),
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    biCompression: BI_RGB.0,
-                    ..Default::default()
-                },
-                ..Default::default()
             };
 
-            let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
-            let dib: windows::core::Result<HBITMAP> =
-                CreateDIBSection(Some(mem_dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0);
-
-            let bitmap = match dib {
-                Ok(b) => b,
-                Err(_) => {
-                    let _ = DeleteDC(mem_dc);
-                    let _ = ReleaseDC(None, screen_dc);
-                    return None;
-                }
-            };
-
-            let old = SelectObject(mem_dc, bitmap.into());
-
-            // Copy pixels from screen into our bitmap
-            use windows::Win32::Graphics::Gdi::{BitBlt, SRCCOPY};
+            // Copy pixels from screen into our cached bitmap
+            use windows::Win32::Graphics::Gdi::{BitBlt, GdiFlush, SRCCOPY};
             let _ = BitBlt(
-                mem_dc,
+                surface.mem_dc,
                 0,
                 0,
                 width as i32,
@@ -312,22 +356,16 @@ impl CaptureEngine for WindowsGdiCopyCaptureEngine {
                 y,
                 SRCCOPY,
             );
+            let _ = ReleaseDC(None, screen_dc);
 
             // Optionally draw cursor on top
             if self.show_cursor {
-                Self::draw_cursor_if_needed(mem_dc, x, y);
+                Self::draw_cursor_if_needed(surface.mem_dc, x, y);
             }
 
-            // Copy DIB memory to Vec<u8>
-            if !bits.is_null() {
-                std::ptr::copy_nonoverlapping(bits as *const u8, data.as_mut_ptr(), data.len());
-            }
-
-            // Cleanup
-            SelectObject(mem_dc, old);
-            let _ = DeleteObject(bitmap.into());
-            let _ = DeleteDC(mem_dc);
-            let _ = ReleaseDC(None, screen_dc);
+            // Make sure GDI has finished writing to the DIB before reading it
+            let _ = GdiFlush();
+            std::ptr::copy_nonoverlapping(surface.bits as *const u8, data.as_mut_ptr(), data.len());
         }
 
         // Note: Window exclusion is not supported on Windows due to OS limitations
@@ -385,6 +423,27 @@ pub struct WindowsCaptureEngine {
     current_cursor_state: bool, // Track actual cursor state in session
     gpu_acceleration: bool, // Enable GPU texture passthrough (zero-copy)
     excluded_windows: Vec<WindowIdentifier>,
+
+    // Performance state
+    frame_options: FrameOptions,
+    /// Staging texture reused across frames (recreated only on size change)
+    staging: Option<(ID3D11Texture2D, u32, u32)>,
+    /// Monitor-relative rect of the last delivered frame (for dirty-region skipping)
+    last_delivered: Option<(i32, i32, u32, u32)>,
+    /// Whether the session reports dirty regions (Windows 11 24H2+)
+    dirty_regions_supported: bool,
+}
+
+/// Monitor-relative dirty rectangles accumulated across drained frames.
+/// `None` means "unknown" (treat whole frame as dirty).
+type DirtyRects = Option<Vec<(i32, i32, i32, i32)>>;
+
+/// Does any dirty rect (x, y, w, h) intersect the monitor-relative region?
+pub(crate) fn dirty_intersects(dirty: &[(i32, i32, i32, i32)], rx: i32, ry: i32, rw: u32, rh: u32) -> bool {
+    let (rx1, ry1) = (rx as i64 + rw as i64, ry as i64 + rh as i64);
+    dirty.iter().any(|&(x, y, w, h)| {
+        (x as i64) < rx1 && (rx as i64) < x as i64 + w as i64 && (y as i64) < ry1 && (ry as i64) < y as i64 + h as i64
+    })
 }
 
 impl WindowsCaptureEngine {
@@ -408,6 +467,10 @@ impl WindowsCaptureEngine {
             current_cursor_state: true,
             gpu_acceleration: false, // TEMPORARILY DISABLED - Different D3D devices cause crash
             excluded_windows: Vec::new(),
+            frame_options: FrameOptions::default(),
+            staging: None,
+            last_delivered: None,
+            dirty_regions_supported: false,
         })
     }
 
@@ -596,12 +659,12 @@ impl WindowsCaptureEngine {
     /// Clips region to monitor bounds and returns only the visible portion
     /// Used as fallback when GPU rendering is not available or clicks need to be drawn
     fn copy_frame_to_cpu(
-        &self,
+        &mut self,
         source_texture: &ID3D11Texture2D,
         region: &CaptureRect,
     ) -> Option<CaptureFrame> {
-        let d3d_device = self.d3d_device.as_ref()?;
-        let d3d_context = self.d3d_context.as_ref()?;
+        let d3d_device = self.d3d_device.clone()?;
+        let d3d_context = self.d3d_context.clone()?;
 
         // Calculate monitor bounds in screen coordinates
         let monitor_left = self.monitor_origin.0;
@@ -636,35 +699,41 @@ impl WindowsCaptureEngine {
             );
         }
 
-        // Create staging texture for CPU read (using clipped dimensions)
-        let staging_desc = D3D11_TEXTURE2D_DESC {
-            Width: clipped_width,
-            Height: clipped_height,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
-            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Usage: D3D11_USAGE_STAGING,
-            BindFlags: 0,
-            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
-            MiscFlags: 0,
-        };
-
-        let mut staging_texture = None;
-        unsafe {
-            if d3d_device
-                .CreateTexture2D(&staging_desc, None, Some(&mut staging_texture))
-                .is_err()
-            {
-                warn!("Failed to create staging texture");
-                return None;
+        // Reuse the staging texture; only recreate when the region size changes.
+        // (Creating a texture per frame forces driver allocations every frame.)
+        let staging_texture = match &self.staging {
+            Some((tex, w, h)) if *w == clipped_width && *h == clipped_height => tex.clone(),
+            _ => {
+                let staging_desc = D3D11_TEXTURE2D_DESC {
+                    Width: clipped_width,
+                    Height: clipped_height,
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
+                    SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Usage: D3D11_USAGE_STAGING,
+                    BindFlags: 0,
+                    CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                    MiscFlags: 0,
+                };
+                let mut tex = None;
+                unsafe {
+                    if d3d_device
+                        .CreateTexture2D(&staging_desc, None, Some(&mut tex))
+                        .is_err()
+                    {
+                        warn!("Failed to create staging texture");
+                        return None;
+                    }
+                }
+                let tex = tex?;
+                self.staging = Some((tex.clone(), clipped_width, clipped_height));
+                tex
             }
-        }
-
-        let staging_texture = staging_texture?;
+        };
 
         // Calculate source position in texture coordinates (relative to monitor origin)
         let src_x = (clipped_left - monitor_left) as u32;
@@ -713,10 +782,14 @@ impl WindowsCaptureEngine {
 
         unsafe {
             let src_ptr = mapped.pData as *const u8;
+            if stride == row_bytes {
+                std::ptr::copy_nonoverlapping(src_ptr, data.as_mut_ptr(), data.len());
+            } else {
             for row in 0..clipped_height as usize {
                 let src_row = src_ptr.add(row * stride);
                 let dst_row = data.as_mut_ptr().add(row * row_bytes);
                 std::ptr::copy_nonoverlapping(src_row, dst_row, row_bytes);
+            }
             }
             d3d_context.Unmap(&staging_texture, 0);
         }
@@ -792,6 +865,21 @@ impl CaptureEngine for WindowsCaptureEngine {
             warn!("SetIsCursorCaptureEnabled failed: {:?}", e);
         }
 
+        // Only report changed areas (Windows 11 24H2+); lets us skip frames whose
+        // changes are entirely outside the shared region. Non-fatal if unsupported.
+        let dirty_regions_supported = capture_session
+            .SetDirtyRegionMode(GraphicsCaptureDirtyRegionMode::ReportOnly)
+            .is_ok();
+        info!("Dirty region reporting supported: {}", dirty_regions_supported);
+
+        // Ask DWM not to produce frames faster than we consume them (Windows 11 24H2+).
+        let fps = self.frame_options.target_fps.max(1) as i64;
+        if let Err(e) = capture_session.SetMinUpdateInterval(windows::Foundation::TimeSpan {
+            Duration: 10_000_000 / fps, // 100ns units
+        }) {
+            debug!("SetMinUpdateInterval not supported: {:?}", e);
+        }
+
         // Try to disable border (Windows 11+)
         if let Err(_) = capture_session.SetIsBorderRequired(false) {
             info!("SetIsBorderRequired not supported (pre-Windows 11)");
@@ -815,6 +903,9 @@ impl CaptureEngine for WindowsCaptureEngine {
         self.monitor_size = monitor_size;
         self.show_cursor = show_cursor;
         self.current_cursor_state = show_cursor;
+        self.dirty_regions_supported = dirty_regions_supported;
+        self.staging = None;
+        self.last_delivered = None;
         self.is_active = true;
         // excluded_windows already stored above, no need to set again
 
@@ -839,6 +930,8 @@ impl CaptureEngine for WindowsCaptureEngine {
         self.d3d_context = None;
         self.d3d_device = None;
         self.capture_region = None;
+        self.staging = None;
+        self.last_delivered = None;
         self.is_active = false;
 
         info!("Capture stopped");
@@ -874,25 +967,40 @@ impl CaptureEngine for WindowsCaptureEngine {
             }
         }
 
-        let frame_pool = self.frame_pool.as_ref()?;
-        let region = self.capture_region.as_ref()?;
+        let frame_pool = self.frame_pool.clone()?;
+        let region = self.capture_region?;
 
-        // Try to get frame from pool (non-blocking)
-        let frame = match frame_pool.TryGetNextFrame() {
-            Ok(f) => {
-                //debug!("Got frame from pool!");
-                f
-            }
-            Err(e) => {
-                // Log only occasionally to avoid spam
-                static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if count % 60 == 0 {
-                    warn!("No frame available (attempt {}): {:?}", count, e);
+        // Drain the pool and keep only the newest frame: older queued frames are
+        // stale and would add latency. Dirty regions are unioned across them.
+        let mut frame: Option<Direct3D11CaptureFrame> = None;
+        let mut dirty: DirtyRects = if self.dirty_regions_supported { Some(Vec::new()) } else { None };
+        while let Ok(f) = frame_pool.TryGetNextFrame() {
+            if let Some(list) = dirty.as_mut() {
+                match f.DirtyRegions() {
+                    Ok(view) => {
+                        let n = view.Size().unwrap_or(0);
+                        for i in 0..n {
+                            if let Ok(r) = view.GetAt(i) {
+                                list.push((r.X, r.Y, r.Width, r.Height));
+                            }
+                        }
+                    }
+                    Err(_) => dirty = None,
                 }
-                return None;
             }
-        };
+            frame = Some(f);
+        }
+        let frame = frame?;
+
+        // Skip the readback entirely when nothing inside the region changed.
+        if self.frame_options.skip_unchanged {
+            if let (Some(list), Some(rect)) = (dirty.as_ref(), self.monitor_relative_clip(&region)) {
+                if self.last_delivered == Some(rect) && !dirty_intersects(list, rect.0, rect.1, rect.2, rect.3) {
+                    return None;
+                }
+            }
+        }
+        let region = &region;
 
         // Get surface from frame
         let surface = match frame.Surface() {
@@ -937,7 +1045,12 @@ impl CaptureEngine for WindowsCaptureEngine {
         }
 
         // CPU fallback path
-        self.copy_frame_to_cpu(&texture, region)
+        let result = self.copy_frame_to_cpu(&texture, region);
+        if result.is_some() {
+            self.last_delivered = self.monitor_relative_clip(region);
+        }
+        drop(frame);
+        result
     }
 
     fn set_cursor_visible(&mut self, visible: bool) -> Result<()> {
@@ -960,12 +1073,27 @@ impl CaptureEngine for WindowsCaptureEngine {
         Ok(())
     }
 
+    fn set_frame_options(&mut self, options: FrameOptions) {
+        self.frame_options = options;
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 }
 
 impl WindowsCaptureEngine {
+    /// Region clipped to the captured monitor, relative to the monitor origin.
+    fn monitor_relative_clip(&self, region: &CaptureRect) -> Option<(i32, i32, u32, u32)> {
+        let (ml, mt) = self.monitor_origin;
+        let (mr, mb) = (ml + self.monitor_size.0 as i32, mt + self.monitor_size.1 as i32);
+        let l = region.x.max(ml);
+        let t = region.y.max(mt);
+        let r = (region.x + region.width as i32).min(mr);
+        let b = (region.y + region.height as i32).min(mb);
+        (l < r && t < b).then(|| (l - ml, t - mt, (r - l) as u32, (b - t) as u32))
+    }
+
     /// Get the current monitor origin (for monitor change detection)
     pub fn get_monitor_origin(&self) -> (i32, i32) {
         self.monitor_origin
@@ -975,3 +1103,17 @@ impl WindowsCaptureEngine {
 // SAFETY: COM objects in WGC are thread-safe
 unsafe impl Send for WindowsCaptureEngine {}
 unsafe impl Sync for WindowsCaptureEngine {}
+
+#[cfg(test)]
+mod perf_tests {
+    use super::dirty_intersects;
+
+    #[test]
+    fn dirty_rect_intersection() {
+        let dirty = [(0, 0, 10, 10), (500, 500, 20, 20)];
+        assert!(dirty_intersects(&dirty, 5, 5, 100, 100));
+        assert!(dirty_intersects(&dirty, 510, 0, 10, 600));
+        assert!(!dirty_intersects(&dirty, 10, 10, 100, 100));
+        assert!(!dirty_intersects(&[], 0, 0, 100, 100));
+    }
+}

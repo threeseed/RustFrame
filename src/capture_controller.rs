@@ -167,6 +167,15 @@ fn start_capture_with_platform(
         "Creating new capture engine"
     );
     *engine_lock = Some(platform.create_capture_engine_for_settings(&settings)?);
+    // Click highlights animate on top of frames, so they need a steady frame
+    // stream; otherwise engines may skip frames whose region did not change.
+    let frame_options = rustframe_capture::FrameOptions {
+        target_fps: settings.target_fps.max(1),
+        skip_unchanged: !settings.capture_clicks,
+    };
+    if let Some(ref mut engine) = *engine_lock {
+        engine.set_frame_options(frame_options);
+    }
 
     if let Some(ref mut engine) = *engine_lock {
         // Offset capture region inward by border_width to exclude border from capture
@@ -200,6 +209,7 @@ fn start_capture_with_platform(
                     *engine_lock =
                         Some(platform.create_capture_engine_for_settings(&fallback_settings)?);
                     if let Some(ref mut fallback_engine) = *engine_lock {
+                        fallback_engine.set_frame_options(frame_options);
                         fallback_engine
                             .start(region, settings.show_cursor, Some(exclusion_list))
                             .map_err(|e| {
