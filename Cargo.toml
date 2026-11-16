@@ -11,7 +11,7 @@ readme = "README.md"
 license = "MIT"
 keywords = ["screen-capture", "cross-platform", "windows", "macos", "linux"]
 categories = ["multimedia", "graphics"]
-rust-version = "1.77.2"
+rust-version = "1.56.0"
 exclude = ["target/", ".git/", ".github/", "*.zip", "ui/node_modules/"]
 
 # Binary target
@@ -124,10 +124,8 @@ foreign-types-shared = "0.3"
 metal = "0.29"
 core-video-sys = "0.1"
 
-# Linux-specific dependencies (X11 capture: MIT-SHM, XDamage, XFixes, RandR)
+# Linux-specific dependencies (placeholder for future)
 [target.'cfg(target_os = "linux")'.dependencies]
-x11rb = { version = "0.13", features = ["shm", "damage", "xfixes", "randr"] }
-libc = "0.2"
 
 [features]
 default = ["custom-protocol", "app"]
