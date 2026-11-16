@@ -17,10 +17,6 @@ This document summarizes current performance-related behavior without hard numbe
 - Reduce capture region size if performance is poor.
 - Disable click highlights if you do not need them.
 
-## Linux (X11)
-See [technical/linux-capture.md](technical/linux-capture.md): region-only MIT-SHM readback,
-XDamage-gated capture (idle when static), latest-frame slot, cached cursor compositing.
-
 ## Further opportunities (Windows / macOS)
 These were identified by reviewing the current engines and are not yet applied:
 
@@ -42,6 +38,6 @@ These were identified by reviewing the current engines and are not yet applied:
   immediately after `CopySubresourceRegion`, stalling the CPU on the GPU copy. A ring of
   2–3 staging textures (map the one copied last frame) removes that stall.
 - **All – buffer reuse.** CPU frame buffers are allocated per frame (`vec![0u8; ..]`);
-  recycling buffers (as the Linux engine does) avoids allocator churn on large regions.
+  recycling buffers avoids allocator churn on large regions.
 - **All – zero-copy preview.** When a GPU handle is present, render the preview directly
   from the shared texture/IOSurface and skip the CPU readback entirely.
