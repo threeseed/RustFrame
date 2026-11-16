@@ -17,7 +17,7 @@ pub mod capture;
 pub mod display_info;
 
 // Re-export commonly used types
-pub use capture::{CaptureEngine, CaptureFrame, CaptureRect, CaptureSettings};
+pub use capture::{CaptureEngine, CaptureFrame, CaptureRect, CaptureSettings, FrameOptions};
 
 #[cfg(target_os = "windows")]
 pub use capture::windows::WindowsCaptureEngine;

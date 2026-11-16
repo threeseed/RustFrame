@@ -17,27 +17,44 @@ This document summarizes current performance-related behavior without hard numbe
 - Reduce capture region size if performance is poor.
 - Disable click highlights if you do not need them.
 
-## Further opportunities (Windows / macOS)
-These were identified by reviewing the current engines and are not yet applied:
+## Capture optimisations
 
-- **macOS – GPU-side crop with `sourceRect`.** `capture/macos_sck.rs` captures the full
-  display and crops on the CPU. Setting `SCStreamConfiguration.sourceRect` (in *points*,
-  display-local, top-left origin) together with `width/height` = region size in *pixels*
-  would let WindowServer do the crop and scale, cutting bandwidth by display/region area.
-  The previous "invalid parameter" error is consistent with passing pixel units.
-- **macOS – skip idle frames.** Check the `SCStreamFrameInfoStatus` attachment and drop
-  frames whose status is not `Complete` (e.g. `Idle`), and use `dirtyRects` to skip
-  readback when no dirty rect intersects the region.
-- **macOS – `minimumFrameInterval`.** Set it from the FPS setting so the compositor
-  doesn't deliver frames faster than they are consumed.
-- **Windows – `DirtyRegion` / `MinUpdateInterval`.** On Windows 11 (24H2+) the
-  `GraphicsCaptureSession.MinUpdateInterval` caps delivery rate and
-  `Direct3D11CaptureFrame.DirtyRegions` allows skipping frames with no change inside
-  the region (`DirtyRegionMode::ReportOnly`).
-- **Windows – staging texture ring.** `capture/windows.rs` maps the staging texture
-  immediately after `CopySubresourceRegion`, stalling the CPU on the GPU copy. A ring of
-  2–3 staging textures (map the one copied last frame) removes that stall.
-- **All – buffer reuse.** CPU frame buffers are allocated per frame (`vec![0u8; ..]`);
-  recycling buffers avoids allocator churn on large regions.
-- **All – zero-copy preview.** When a GPU handle is present, render the preview directly
-  from the shared texture/IOSurface and skip the CPU readback entirely.
+Engines receive `FrameOptions { target_fps, skip_unchanged }` before `start`.
+`skip_unchanged` is enabled unless click highlights are on (their dissolve animation
+needs a steady frame stream). When it is enabled, `get_frame` returns `None` for frames
+whose capture region did not change, so the preview is not re-rendered needlessly.
+
+### macOS (ScreenCaptureKit)
+- **GPU-side crop.** The stream is configured with `sourceRect` (display points,
+  top-left origin) and an output size equal to the region in pixels, so WindowServer
+  delivers only the region. Region moves/resizes are applied with
+  `updateConfiguration:` asynchronously on the main queue (one update in flight, latest
+  region wins). If `sourceRect` is rejected at start or on update, the engine falls back
+  to full-display capture with CPU crop for the rest of the session.
+- **Frame interval.** `minimumFrameInterval` follows the FPS setting (important on
+  120 Hz ProMotion displays).
+- **Idle and unchanged frames.** Frames with status Idle/Blank/Suspended/Stopped are
+  ignored; frames whose `dirtyRects` don't touch the crop are not copied.
+- **No duplicate copies.** The latest frame is moved out of the capture slot instead of
+  cloned on every poll, and the slot's unconsumed buffer is reused by the next frame.
+
+### Windows (Windows.Graphics.Capture)
+- **Staging texture reuse.** The CPU readback texture is created once per region size
+  instead of every frame; rows are copied with one `memcpy` when there is no padding.
+- **Newest frame only.** The frame pool is drained each poll and only the newest frame is
+  read back, removing queued-frame latency.
+- **Dirty regions.** `DirtyRegionMode::ReportOnly` (Windows 11 24H2+); frames whose dirty
+  rects miss the region are dropped without readback.
+- **`MinUpdateInterval`** follows the FPS setting (Windows 11 24H2+). Both are no-ops on
+  older Windows.
+
+### Windows (GDI copy)
+- The memory DC and DIB section are cached and recreated only on size change.
+
+### Not done
+- **Staging texture ring (Windows).** Mapping the previous frame's copy avoids the
+  `Map` stall but adds one frame of latency. With the staging texture reused, the copy
+  is a small region and the stall is short, so latency was preferred.
+- **Zero-copy preview (Windows).** The GPU path stays disabled: the capture and preview
+  use different D3D11 devices, which crashes (see `gpu_acceleration` in
+  `capture/windows.rs`). Sharing one device is needed first.

@@ -54,6 +54,27 @@ impl Default for CaptureSettings {
     }
 }
 
+/// Frame delivery options passed to engines before `start`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameOptions {
+    /// Upper bound on frames delivered per second (engines may ask the OS
+    /// compositor not to produce frames faster than this).
+    pub target_fps: u32,
+    /// When true, engines may return `None` instead of a frame whose capture
+    /// region did not change. Must be false when the consumer needs a steady
+    /// stream of frames (e.g. animated click highlights drawn on top).
+    pub skip_unchanged: bool,
+}
+
+impl Default for FrameOptions {
+    fn default() -> Self {
+        Self {
+            target_fps: 60,
+            skip_unchanged: false,
+        }
+    }
+}
+
 /// A captured frame containing pixel data
 #[derive(Debug)]
 pub struct CaptureFrame {
@@ -151,6 +172,9 @@ pub trait CaptureEngine: Send {
     fn set_scale_factor(&mut self, _scale: f64) -> anyhow::Result<()> {
         Ok(()) // Default implementation does nothing
     }
+
+    /// Configure frame delivery (call before `start`).
+    fn set_frame_options(&mut self, _options: FrameOptions) {}
 
     /// Downcast to Any for platform-specific access
     fn as_any(&self) -> &dyn std::any::Any;

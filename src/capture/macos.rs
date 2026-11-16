@@ -364,6 +364,11 @@ pub struct MacOSCaptureEngine {
     sck: Option<ScreenCaptureKitCapture>,
     sck_last_seq: u64,
     using_sck: bool,
+
+    /// Frame delivery options from the controller
+    frame_options: super::FrameOptions,
+    /// Last SCK frame, kept only when unchanged frames must be repeated
+    sck_repeat: Option<(Vec<u8>, u32, u32)>,
 }
 
 /// Context for dispatch_sync callback - returns raw pixel data, not CGImage
@@ -606,6 +611,8 @@ impl MacOSCaptureEngine {
             sck,
             sck_last_seq: 0,
             using_sck: false,
+            frame_options: super::FrameOptions::default(),
+            sck_repeat: None,
         })
     }
 
@@ -749,6 +756,12 @@ impl CaptureEngine for MacOSCaptureEngine {
             ));
         }
 
+        sck.set_frame_options(
+            self.frame_options.target_fps,
+            self.frame_options.skip_unchanged,
+        );
+        self.sck_repeat = None;
+
         log::info!("[MACOS_ENGINE] SCK is supported, calling sck.start()...");
         match sck.start(
             region.x,
@@ -779,6 +792,7 @@ impl CaptureEngine for MacOSCaptureEngine {
     fn stop(&mut self) {
         self.is_active = false;
         self.last_frame = None;
+        self.sck_repeat = None;
         if self.using_sck {
             if let Some(ref mut sck) = self.sck {
                 sck.stop();
@@ -813,51 +827,51 @@ impl CaptureEngine for MacOSCaptureEngine {
         }
 
         if self.using_sck {
-            if let Some(region) = self.region {
-                if let Some(ref sck) = self.sck {
-                    if let Some((data, w, h, seq)) = sck.latest_frame_rgba() {
-                        if seq != self.sck_last_seq {
-                            self.sck_last_seq = seq;
-                        }
+            let region = self.region?;
+            let sck = self.sck.as_ref()?;
+            sck.sync_stream_config();
 
-                        // Get IOSurface data for GPU acceleration (includes retained pointer)
-                        let gpu_texture = sck.latest_iosurface().map(
-                            |(
-                                iosurface_ptr,
-                                iosurface_id,
-                                pixel_format,
-                                crop_x,
-                                crop_y,
-                                crop_w,
-                                crop_h,
-                            )| {
-                                super::GpuTextureHandle::Metal {
-                                    iosurface_ptr,
-                                    iosurface_id,
-                                    pixel_format,
-                                    crop_x,
-                                    crop_y,
-                                    crop_w,
-                                    crop_h,
-                                }
-                            },
-                        );
-
-                        return Some(CaptureFrame {
-                            data,
-                            width: w,
-                            height: h,
-                            stride: w * 4,
-                            offset_x: region.x,
-                            offset_y: region.y,
-                            gpu_texture,
-                        });
+            // Move the new frame out of the capture slot (no copy). When there is
+            // no new frame, either skip (nothing changed) or repeat the last one.
+            let (data, w, h) = match sck.take_latest_frame_rgba() {
+                Some((data, w, h, seq)) => {
+                    self.sck_last_seq = seq;
+                    if self.frame_options.skip_unchanged {
+                        self.sck_repeat = None;
+                    } else {
+                        self.sck_repeat = Some((data.clone(), w, h));
                     }
+                    (data, w, h)
                 }
-            }
-            return None;
-        }
+                None if !self.frame_options.skip_unchanged => self.sck_repeat.clone()?,
+                None => return None,
+            };
 
+            // Get IOSurface data for GPU acceleration (includes retained pointer)
+            let gpu_texture = sck.latest_iosurface().map(
+                |(iosurface_ptr, iosurface_id, pixel_format, crop_x, crop_y, crop_w, crop_h)| {
+                    super::GpuTextureHandle::Metal {
+                        iosurface_ptr,
+                        iosurface_id,
+                        pixel_format,
+                        crop_x,
+                        crop_y,
+                        crop_w,
+                        crop_h,
+                    }
+                },
+            );
+
+            return Some(CaptureFrame {
+                data,
+                width: w,
+                height: h,
+                stride: w * 4,
+                offset_x: region.x,
+                offset_y: region.y,
+                gpu_texture,
+            });
+        }
         if let Some(region) = self.region {
             if self.capture_region(region).is_ok() {
                 if let Some(pixel_data) = &self.last_frame {
@@ -893,6 +907,13 @@ impl CaptureEngine for MacOSCaptureEngine {
             }
         }
         Ok(())
+    }
+
+    fn set_frame_options(&mut self, options: super::FrameOptions) {
+        self.frame_options = options;
+        if let Some(ref sck) = self.sck {
+            sck.set_frame_options(options.target_fps, options.skip_unchanged);
+        }
     }
 
     fn set_scale_factor(&mut self, scale: f64) -> Result<()> {

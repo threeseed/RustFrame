@@ -22,17 +22,53 @@ use objc::rc::{autoreleasepool, StrongPtr};
 use objc::runtime::{Class, Object, Sel};
 use objc::{class, msg_send, sel, sel_impl};
 use std::ffi::c_void;
+use core_graphics::geometry::{CGPoint, CGRect, CGSize};
 use std::sync::{
-    atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering},
     Arc, Mutex,
 };
 
 #[link(name = "ScreenCaptureKit", kind = "framework")]
-extern "C" {}
+extern "C" {
+    static SCStreamFrameInfoStatus: *const c_void;
+    static SCStreamFrameInfoDirtyRects: *const c_void;
+}
 
 #[link(name = "CoreMedia", kind = "framework")]
 extern "C" {
     fn CMSampleBufferGetImageBuffer(sample_buffer: *const c_void) -> *mut c_void;
+    fn CMSampleBufferGetSampleAttachmentsArray(
+        sample_buffer: *const c_void,
+        create_if_necessary: u8,
+    ) -> *const c_void;
+}
+
+/// CoreMedia CMTime (passed by value to setMinimumFrameInterval:)
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CMTime {
+    value: i64,
+    timescale: i32,
+    flags: u32,
+    epoch: i64,
+}
+
+const KCMTIME_FLAGS_VALID: u32 = 1;
+const KCFNUMBER_SINT64_TYPE: isize = 4;
+
+// SCFrameStatus values
+const SC_FRAME_STATUS_IDLE: i64 = 1;
+const SC_FRAME_STATUS_BLANK: i64 = 2;
+const SC_FRAME_STATUS_SUSPENDED: i64 = 3;
+const SC_FRAME_STATUS_STOPPED: i64 = 5;
+
+fn frame_interval(fps: u32) -> CMTime {
+    CMTime {
+        value: 1,
+        timescale: fps.clamp(1, 240) as i32,
+        flags: KCMTIME_FLAGS_VALID,
+        epoch: 0,
+    }
 }
 
 #[link(name = "CoreVideo", kind = "framework")]
@@ -56,12 +92,17 @@ extern "C" {
 extern "C" {
     fn CFRetain(cf: *mut c_void) -> *mut c_void;
     fn CFRelease(cf: *mut c_void);
+    fn CFArrayGetCount(array: *const c_void) -> isize;
+    fn CFArrayGetValueAtIndex(array: *const c_void, idx: isize) -> *const c_void;
+    fn CFDictionaryGetValue(dict: *const c_void, key: *const c_void) -> *const c_void;
+    fn CFNumberGetValue(number: *const c_void, the_type: isize, value_ptr: *mut c_void) -> bool;
 }
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGMainDisplayID() -> u32;
     fn CGPreflightScreenCaptureAccess() -> bool;
+    fn CGRectMakeWithDictionaryRepresentation(dict: *const c_void, rect: *mut CGRect) -> bool;
 }
 
 // libdispatch
@@ -80,6 +121,11 @@ extern "C" {
     fn dispatch_semaphore_create(value: isize) -> *mut c_void;
     fn dispatch_semaphore_wait(sema: *mut c_void, timeout: u64) -> isize;
     fn dispatch_semaphore_signal(sema: *mut c_void) -> isize;
+    fn dispatch_async_f(
+        queue: *const c_void,
+        context: *mut c_void,
+        work: extern "C" fn(*mut c_void),
+    );
 }
 
 const DISPATCH_TIME_FOREVER: u64 = u64::MAX;
@@ -105,6 +151,24 @@ struct OutputState {
     region_w: AtomicU32,
     region_h: AtomicU32,
     scale_milli: AtomicU32,
+
+    // --- performance state ---
+    /// Max frames per second requested from the compositor
+    fps: AtomicU32,
+    /// Skip CPU copies when no dirty rect touches the region
+    skip_unchanged: AtomicBool,
+    /// Stream is configured with sourceRect = region (GPU-side crop), so
+    /// delivered buffers already contain exactly the region
+    source_rect_active: AtomicBool,
+    /// sourceRect failed once; stay in full-display mode
+    source_rect_disabled: AtomicBool,
+    /// A stream configuration update is in flight
+    config_inflight: AtomicBool,
+    /// Region (points) the stream configuration currently targets
+    applied_region: Mutex<Option<(i32, i32, u32, u32)>>,
+    /// Crop rect (pixels) of the last frame copied out, for dirty-rect skipping
+    last_crop: Mutex<Option<(i64, i64, i64, i64)>>,
+    show_cursor: AtomicBool,
 }
 
 impl OutputState {
@@ -119,7 +183,45 @@ impl OutputState {
             region_w: AtomicU32::new(0),
             region_h: AtomicU32::new(0),
             scale_milli: AtomicU32::new(1000),
+            fps: AtomicU32::new(60),
+            skip_unchanged: AtomicBool::new(false),
+            source_rect_active: AtomicBool::new(false),
+            source_rect_disabled: AtomicBool::new(false),
+            config_inflight: AtomicBool::new(false),
+            applied_region: Mutex::new(None),
+            last_crop: Mutex::new(None),
+            show_cursor: AtomicBool::new(true),
         }
+    }
+
+    fn region_points(&self) -> (i32, i32, u32, u32) {
+        (
+            self.region_x.load(Ordering::Relaxed),
+            self.region_y.load(Ordering::Relaxed),
+            self.region_w.load(Ordering::Relaxed),
+            self.region_h.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Take the spare buffer of an unconsumed frame (latest-frame-wins), so the
+    /// callback does not allocate a new Vec for every frame.
+    fn take_spare(&self) -> Vec<u8> {
+        self.latest
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take())
+            .map(|(d, _, _)| d)
+            .unwrap_or_default()
+    }
+
+    /// Move the latest frame out (no copy).
+    fn take(&self) -> Option<(Vec<u8>, u32, u32, u64)> {
+        let seq = self.seq.load(Ordering::Relaxed);
+        self.latest
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take())
+            .map(|(d, w, h)| (d, w, h, seq))
     }
 
     fn set_region_points(&self, x: i32, y: i32, w: u32, h: u32) {
@@ -191,15 +293,6 @@ impl OutputState {
         if let Ok(mut g) = self.latest_iosurface.lock() {
             *g = Some((iosurface_id, pixel_format, crop_x, crop_y, crop_w, crop_h));
         }
-    }
-
-    fn get(&self) -> Option<(Vec<u8>, u32, u32, u64)> {
-        let seq = self.seq.load(Ordering::Relaxed);
-        self.latest
-            .lock()
-            .ok()
-            .and_then(|g| g.clone())
-            .map(|(d, w, h)| (d, w, h, seq))
     }
 
     fn get_iosurface(&self) -> Option<(*mut std::ffi::c_void, u32, u32, i64, i64, i64, i64)> {
@@ -307,6 +400,18 @@ fn ensure_output_class() -> *const Class {
                     return;
                 }
 
+                // Frame status / dirty rects (ScreenCaptureKit attachments)
+                let (status, dirty) = frame_info(sample_buffer as *const c_void);
+                if matches!(
+                    status,
+                    Some(SC_FRAME_STATUS_IDLE)
+                        | Some(SC_FRAME_STATUS_BLANK)
+                        | Some(SC_FRAME_STATUS_SUSPENDED)
+                        | Some(SC_FRAME_STATUS_STOPPED)
+                ) {
+                    return;
+                }
+
                 // Extract IOSurface for GPU acceleration (before locking pixel buffer)
                 let iosurface = CVPixelBufferGetIOSurface(pixel_buffer);
 
@@ -351,6 +456,15 @@ fn ensure_output_class() -> *const Class {
                 let mut rw_px = ((rw_pt * scale_m) + 500) / 1000;
                 let mut rh_px = ((rh_pt * scale_m) + 500) / 1000;
 
+                // With sourceRect active the compositor already cropped (and scaled)
+                // the buffer to the region, so the whole buffer is the region.
+                if state.source_rect_active.load(Ordering::Acquire) {
+                    rx_px = 0;
+                    ry_px = 0;
+                    rw_px = full_w as i64;
+                    rh_px = full_h as i64;
+                }
+
                 if rw_px <= 0 || rh_px <= 0 {
                     // Fallback: full frame
                     rx_px = 0;
@@ -389,7 +503,23 @@ fn ensure_output_class() -> *const Class {
                     return;
                 }
 
-                let mut rgba = vec![0u8; (out_w as usize) * (out_h as usize) * 4];
+                // Nothing inside the crop changed since the last copied frame: skip.
+                let crop = (rx_px, ry_px, rw_px, rh_px);
+                if state.skip_unchanged.load(Ordering::Relaxed) {
+                    if let Some(rects) = dirty.as_ref() {
+                        let same_crop = state.last_crop.lock().map(|g| *g == Some(crop)).unwrap_or(false);
+                        if same_crop && !rects.iter().any(|r| rect_intersects(r, crop)) {
+                            let _ = CVPixelBufferUnlockBaseAddress(
+                                pixel_buffer,
+                                KCVPIXELBUFFERLOCK_READONLY,
+                            );
+                            return;
+                        }
+                    }
+                }
+
+                let mut rgba = state.take_spare();
+                rgba.resize((out_w as usize) * (out_h as usize) * 4, 0);
                 let out_stride = (out_w as usize) * 4;
 
                 // OPTIMIZED: Bulk copy rows then swap channels in-place
@@ -445,6 +575,9 @@ fn ensure_output_class() -> *const Class {
                     );
                 }
 
+                if let Ok(mut g) = state.last_crop.lock() {
+                    *g = Some(crop);
+                }
                 state.set(rgba, out_w, out_h);
             }
         }
@@ -459,6 +592,150 @@ fn ensure_output_class() -> *const Class {
     });
 
     unsafe { CLS }
+}
+
+/// Does a dirty rect (pixels) intersect crop (x, y, w, h in pixels)?
+fn rect_intersects(r: &CGRect, crop: (i64, i64, i64, i64)) -> bool {
+    let (cx, cy, cw, ch) = (crop.0 as f64, crop.1 as f64, crop.2 as f64, crop.3 as f64);
+    r.origin.x < cx + cw
+        && cx < r.origin.x + r.size.width
+        && r.origin.y < cy + ch
+        && cy < r.origin.y + r.size.height
+}
+
+/// Read SCStreamFrameInfo status and dirty rects from a sample buffer.
+/// Dirty rects are `None` when not reported (treat as fully dirty).
+unsafe fn frame_info(sample_buffer: *const c_void) -> (Option<i64>, Option<Vec<CGRect>>) {
+    let attachments = CMSampleBufferGetSampleAttachmentsArray(sample_buffer, 0);
+    if attachments.is_null() || CFArrayGetCount(attachments) < 1 {
+        return (None, None);
+    }
+    let dict = CFArrayGetValueAtIndex(attachments, 0);
+    if dict.is_null() {
+        return (None, None);
+    }
+
+    let status = {
+        let num = CFDictionaryGetValue(dict, SCStreamFrameInfoStatus);
+        let mut v: i64 = 0;
+        if !num.is_null() && CFNumberGetValue(num, KCFNUMBER_SINT64_TYPE, &mut v as *mut i64 as *mut c_void) {
+            Some(v)
+        } else {
+            None
+        }
+    };
+
+    let rects_arr = CFDictionaryGetValue(dict, SCStreamFrameInfoDirtyRects);
+    let dirty = if rects_arr.is_null() {
+        None
+    } else {
+        let n = CFArrayGetCount(rects_arr);
+        let mut out = Vec::with_capacity(n.max(0) as usize);
+        for i in 0..n {
+            let d = CFArrayGetValueAtIndex(rects_arr, i);
+            let mut r = CGRect::new(&CGPoint::new(0.0, 0.0), &CGSize::new(0.0, 0.0));
+            if d.is_null() || !CGRectMakeWithDictionaryRepresentation(d, &mut r) {
+                return (status, None); // unparseable → treat as fully dirty
+            }
+            out.push(r);
+        }
+        Some(out)
+    };
+    (status, dirty)
+}
+
+/// Clamp a region (top-left points) to the display and return the
+/// sourceRect (points) plus output size (pixels).
+fn source_rect_for(region: (i32, i32, u32, u32), scale: f64) -> Option<(CGRect, usize, usize)> {
+    let info = crate::display_info::get();
+    let (dw, dh) = (info.width_points, info.height_points);
+    let x = (region.0 as f64).clamp(0.0, dw);
+    let y = (region.1 as f64).clamp(0.0, dh);
+    let w = (region.0 as f64 + region.2 as f64).min(dw) - x;
+    let h = (region.1 as f64 + region.3 as f64).min(dh) - y;
+    if w < 1.0 || h < 1.0 {
+        return None;
+    }
+    let rect = CGRect::new(&CGPoint::new(x, y), &CGSize::new(w, h));
+    Some((rect, (w * scale).round() as usize, (h * scale).round() as usize))
+}
+
+/// Build a SCStreamConfiguration for the current state.
+/// `region` = Some → GPU-side crop via sourceRect; None → full display.
+unsafe fn build_config(state: &OutputState, region: Option<(i32, i32, u32, u32)>) -> id {
+    let cfg: id = msg_send![class!(SCStreamConfiguration), new];
+    if cfg == nil {
+        return nil;
+    }
+    let scale = state.scale_milli.load(Ordering::Relaxed).max(1) as f64 / 1000.0;
+    let info = crate::display_info::get();
+    let (w, h) = match region.and_then(|r| source_rect_for(r, scale)) {
+        Some((rect, w, h)) if responds(cfg, sel!(setSourceRect:)) => {
+            let _: () = msg_send![cfg, setSourceRect: rect];
+            (w, h)
+        }
+        _ => (info.width_pixels as usize, info.height_pixels as usize),
+    };
+    if responds(cfg, sel!(setWidth:)) {
+        let _: () = msg_send![cfg, setWidth: w as NSUInteger];
+    }
+    if responds(cfg, sel!(setHeight:)) {
+        let _: () = msg_send![cfg, setHeight: h as NSUInteger];
+    }
+    if responds(cfg, sel!(setShowsCursor:)) {
+        let show: i8 = if state.show_cursor.load(Ordering::Relaxed) { 1 } else { 0 };
+        let _: () = msg_send![cfg, setShowsCursor: show];
+    }
+    if responds(cfg, sel!(setPixelFormat:)) {
+        let _: () = msg_send![cfg, setPixelFormat: KCVPIXELFORMATTYPE_32BGRA];
+    }
+    if responds(cfg, sel!(setQueueDepth:)) {
+        let _: () = msg_send![cfg, setQueueDepth: 3 as NSUInteger];
+    }
+    if responds(cfg, sel!(setMinimumFrameInterval:)) {
+        let _: () = msg_send![cfg, setMinimumFrameInterval: frame_interval(state.fps.load(Ordering::Relaxed))];
+    }
+    cfg
+}
+
+struct ConfigUpdate {
+    stream: id, // retained
+    state: Arc<OutputState>,
+    region: Option<(i32, i32, u32, u32)>,
+}
+
+extern "C" fn apply_config_update(ctx: *mut c_void) {
+    let ctx = unsafe { Box::from_raw(ctx as *mut ConfigUpdate) };
+    unsafe {
+        autoreleasepool(|| {
+            let cfg = build_config(&ctx.state, ctx.region);
+            if cfg == nil || !responds(ctx.stream, sel!(updateConfiguration:completionHandler:)) {
+                ctx.state.config_inflight.store(false, Ordering::Release);
+                if cfg != nil {
+                    let _: () = msg_send![cfg, release];
+                }
+                return;
+            }
+            let state = ctx.state.clone();
+            let region = ctx.region;
+            let block = ConcreteBlock::new(move |error: id| {
+                if error == nil {
+                    if let Ok(mut g) = state.applied_region.lock() {
+                        *g = region;
+                    }
+                    state.source_rect_active.store(region.is_some(), Ordering::Release);
+                } else if region.is_some() {
+                    log::warn!("[SCK] sourceRect update failed; falling back to full-display capture");
+                    state.source_rect_disabled.store(true, Ordering::Release);
+                }
+                state.config_inflight.store(false, Ordering::Release);
+            })
+            .copy();
+            let _: () = msg_send![ctx.stream, updateConfiguration: cfg completionHandler: &*block];
+            let _: () = msg_send![cfg, release];
+        });
+        let _: () = msg_send![ctx.stream, release];
+    }
 }
 
 /// Build an NSArray of SCWindow objects to exclude from capture
@@ -654,6 +931,7 @@ impl ScreenCaptureKitCapture {
 
     pub fn update_region_points(&self, x: i32, y: i32, w: u32, h: u32) {
         self.state.set_region_points(x, y, w, h);
+        self.sync_stream_config();
     }
 
     pub fn update_scale(&self, scale: f64) {
@@ -711,354 +989,307 @@ impl ScreenCaptureKitCapture {
         // Prepare excluded windows for the closure
         let excluded_for_closure = excluded_windows.clone();
 
-        run_on_main_thread(|| unsafe {
-            autoreleasepool(|| {
-                log::info!("[SCK] Inside main thread autorelease pool");
-                // Backing scale (points->pixels) for main screen.
-                let screen: id = msg_send![class!(NSScreen), mainScreen];
-                let scale: f64 = if screen != nil {
-                    let s: f64 = msg_send![screen, backingScaleFactor];
-                    if s > 0.0 {
-                        s
+        let try_source_rect = !self.state.source_rect_disabled.load(Ordering::Acquire);
+        for use_source_rect in [try_source_rect, false] {
+            start_err = None;
+            run_on_main_thread(|| unsafe {
+                autoreleasepool(|| {
+                    log::info!("[SCK] Inside main thread autorelease pool");
+                    // Backing scale (points->pixels) for main screen.
+                    let screen: id = msg_send![class!(NSScreen), mainScreen];
+                    let scale: f64 = if screen != nil {
+                        let s: f64 = msg_send![screen, backingScaleFactor];
+                        if s > 0.0 {
+                            s
+                        } else {
+                            1.0
+                        }
                     } else {
                         1.0
-                    }
-                } else {
-                    1.0
-                };
-                let scale_milli = (scale * 1000.0).round().max(1.0) as u32;
-                (*(state_ptr)).set_scale_milli(scale_milli);
-
-                let main_display_id = CGMainDisplayID();
-
-                log::info!("[SCK] Fetching shareable content...");
-                let sema = dispatch_semaphore_create(0);
-                if sema.is_null() {
-                    log::error!("[SCK] Failed to create dispatch semaphore");
-                    start_err = Some("Failed to create dispatch semaphore".to_string());
-                    return;
-                }
-                log::info!("[SCK] Semaphore created: {:p}", sema);
-
-                let shareable_cls = class!(SCShareableContent);
-                log::info!(
-                    "[SCK] SCShareableContent class obtained: {:p}",
-                    shareable_cls
-                );
-
-                let result: Arc<Mutex<(id, id)>> = Arc::new(Mutex::new((nil, nil)));
-                let result_cb = result.clone();
-                let sema_cb = sema;
-
-                log::info!("[SCK] Creating completion handler block...");
-                let block = ConcreteBlock::new(move |content: id, error: id| {
-                    // CRITICAL: Retain the Objective-C objects before storing them
-                    // They need to survive beyond the autorelease pool of the callback
-                    let retained_content = if content != nil {
-                        let _: id = msg_send![content, retain];
-                        content
-                    } else {
-                        nil
                     };
-                    let retained_error = if error != nil {
-                        let _: id = msg_send![error, retain];
-                        error
-                    } else {
-                        nil
-                    };
+                    let scale_milli = (scale * 1000.0).round().max(1.0) as u32;
+                    (*(state_ptr)).set_scale_milli(scale_milli);
 
-                    if let Ok(mut g) = result_cb.lock() {
-                        *g = (retained_content, retained_error);
-                    }
-                    unsafe {
-                        dispatch_semaphore_signal(sema_cb);
-                    }
-                })
-                .copy();
-                log::info!(
-                    "[SCK] Block created, calling getShareableContentWithCompletionHandler..."
-                );
+                    let main_display_id = CGMainDisplayID();
 
-                let _: () =
-                    msg_send![shareable_cls, getShareableContentWithCompletionHandler: &*block];
-                log::info!("[SCK] Waiting for shareable content...");
-                let _ = dispatch_semaphore_wait(sema, DISPATCH_TIME_FOREVER);
-                log::info!("[SCK] Shareable content received");
-                let (shareable, shareable_error) = result
-                    .lock()
-                    .ok()
-                    .map(|guard| (guard.0, guard.1))
-                    .unwrap_or((nil, nil));
-
-                if shareable_error != nil {
-                    let desc: id = msg_send![shareable_error, localizedDescription];
-                    let cstr: *const std::os::raw::c_char = msg_send![desc, UTF8String];
-                    let s = if !cstr.is_null() {
-                        std::ffi::CStr::from_ptr(cstr).to_string_lossy().to_string()
-                    } else {
-                        "Unknown ScreenCaptureKit error".to_string()
-                    };
-                    start_err = Some(format!("ScreenCaptureKit getShareableContent failed: {s}"));
-                    return;
-                }
-                if shareable == nil {
-                    log::error!("[SCK] Shareable content is nil");
-                    start_err =
-                        Some("ScreenCaptureKit returned null shareable content".to_string());
-                    return;
-                }
-
-                log::info!("[SCK] Shareable content valid, fetching displays...");
-                let displays: id = msg_send![shareable, displays];
-                if displays == nil {
-                    start_err =
-                        Some("ScreenCaptureKit shareable content has no displays".to_string());
-                    return;
-                }
-
-                let count: NSUInteger = msg_send![displays, count];
-                log::info!("[SCK] Found {} displays", count);
-                let mut target_display: id = nil;
-                for i in 0..count {
-                    let d: id = msg_send![displays, objectAtIndex: i];
-                    if d == nil {
-                        continue;
-                    }
-                    let did: u32 = msg_send![d, displayID];
-                    if did == main_display_id {
-                        log::info!("[SCK] Found main display: {}", did);
-                        target_display = d;
-                        break;
-                    }
-                }
-                if target_display == nil {
-                    log::error!(
-                        "[SCK] Main display {} not found in shareable displays",
-                        main_display_id
-                    );
-                    start_err = Some("ScreenCaptureKit could not find main display".to_string());
-                    return;
-                }
-
-                log::info!("[SCK] Creating content filter...");
-                // Create filter and config with exclusion list
-                let excluding_windows =
-                    build_excluding_windows_array(&excluded_for_closure, shareable);
-                let filter: id = msg_send![class!(SCContentFilter), alloc];
-                let filter: id = msg_send![filter, initWithDisplay: target_display excludingWindows: excluding_windows];
-                if filter == nil {
-                    start_err = Some("Failed to create SCContentFilter".to_string());
-                    return;
-                }
-
-                let cfg: id = msg_send![class!(SCStreamConfiguration), new];
-                if cfg == nil {
-                    start_err = Some("Failed to create SCStreamConfiguration".to_string());
-                    return;
-                }
-
-                // Get capture region in pixels
-                let state_ref = &*(state_ptr);
-                let rx_pt = state_ref.region_x.load(Ordering::Relaxed) as f64;
-                let ry_pt = state_ref.region_y.load(Ordering::Relaxed) as f64;
-                let rw_pt = state_ref.region_w.load(Ordering::Relaxed) as f64;
-                let rh_pt = state_ref.region_h.load(Ordering::Relaxed) as f64;
-
-                // Ensure display info is initialized (required for correct sizing).
-                if !crate::display_info::is_initialized() {
-                    log::warn!("[SCK] DisplayInfo not initialized, initializing on main thread...");
-                    if let Err(e) = crate::display_info::initialize() {
-                        start_err = Some(format!("Failed to initialize display info: {e}"));
+                    log::info!("[SCK] Fetching shareable content...");
+                    let sema = dispatch_semaphore_create(0);
+                    if sema.is_null() {
+                        log::error!("[SCK] Failed to create dispatch semaphore");
+                        start_err = Some("Failed to create dispatch semaphore".to_string());
                         return;
                     }
-                }
+                    log::info!("[SCK] Semaphore created: {:p}", sema);
 
-                // Get display dimensions from centralized DisplayInfo
-                let display_info = crate::display_info::get();
-                let display_w_px = display_info.width_pixels as f64;
-                let display_h_px = display_info.height_pixels as f64;
-
-                // Convert AppKit coordinates (bottom-left origin, points) to CGDisplay (top-left origin, pixels)
-                // This is the CORRECT way - using centralized coordinate conversion
-                let (rx_px, ry_px, rw_px, rh_px) =
-                    display_info.appkit_to_cgdisplay(rx_pt, ry_pt, rw_pt, rh_pt);
-                let mut rx_px = rx_px;
-                let mut ry_px = ry_px;
-                let mut rw_px = rw_px;
-                let mut rh_px = rh_px;
-
-                // Clamp to display bounds to prevent crash
-                rx_px = rx_px.max(0.0).min(display_w_px - 1.0);
-                ry_px = ry_px.max(0.0).min(display_h_px - 1.0);
-                rw_px = rw_px.min(display_w_px - rx_px).max(1.0);
-                rh_px = rh_px.min(display_h_px - ry_px).max(1.0);
-
-                log::info!(
-                    "[SCK] Display: {}x{} pixels @ {:.1}x scale",
-                    display_w_px,
-                    display_h_px,
-                    display_info.scale_factor
-                );
-                log::info!(
-                    "[SCK] Region (AppKit): {}x{} at ({}, {}) points",
-                    rw_pt,
-                    rh_pt,
-                    rx_pt,
-                    ry_pt
-                );
-                log::info!(
-                    "[SCK] Region (CGDisplay): {}x{} at ({}, {}) pixels (Y-flipped)",
-                    rw_px,
-                    rh_px,
-                    rx_px,
-                    ry_px
-                );
-
-                // NOTE: sourceRect is not used currently due to "invalid parameter" error
-                // Instead, we capture full display and crop in CPU/GPU
-                // TODO: Debug sourceRect parameter requirements for GPU-level crop
-                // if responds(cfg, sel!(setSourceRect:)) {
-                // 	let source_rect = CGRect {
-                // 		origin: CGPoint { x: rx_px, y: ry_px },
-                // 		size: CGSize { width: rw_px, height: rh_px },
-                // 	};
-                // 	let _: () = msg_send![cfg, setSourceRect: source_rect];
-                // 	log::info!("[SCK] Set sourceRect: origin=({:.0}, {:.0}), size=({:.0}, {:.0})", rx_px, ry_px, rw_px, rh_px);
-                // }
-
-                // Set output width/height to full display (we'll crop in delegate)
-                if responds(cfg, sel!(setWidth:)) {
-                    let _: () = msg_send![cfg, setWidth: display_w_px as NSUInteger];
-                }
-                if responds(cfg, sel!(setHeight:)) {
-                    let _: () = msg_send![cfg, setHeight: display_h_px as NSUInteger];
-                }
-                if responds(cfg, sel!(setShowsCursor:)) {
-                    let _: () =
-                        msg_send![cfg, setShowsCursor: if show_cursor_local { 1 } else { 0 }];
-                }
-                if responds(cfg, sel!(setPixelFormat:)) {
-                    let _: () = msg_send![cfg, setPixelFormat: KCVPIXELFORMATTYPE_32BGRA];
-                }
-                if responds(cfg, sel!(setQueueDepth:)) {
-                    let _: () = msg_send![cfg, setQueueDepth: 2 as NSUInteger];
-                }
-
-                log::info!("[SCK] Creating SCStream...");
-                let stream: id = msg_send![class!(SCStream), alloc];
-                let stream: id =
-                    msg_send![stream, initWithFilter: filter configuration: cfg delegate: nil];
-                if stream == nil {
-                    log::error!("[SCK] Failed to create SCStream");
-                    start_err = Some("Failed to create SCStream".to_string());
-                    return;
-                }
-                log::info!("[SCK] SCStream created successfully");
-
-                let out_cls = ensure_output_class();
-                if out_cls.is_null() {
-                    start_err = Some("Failed to create SCStreamOutput class".to_string());
-                    return;
-                }
-                let out: id = msg_send![out_cls, new];
-                if out == nil {
-                    start_err = Some("Failed to create SCStreamOutput instance".to_string());
-                    return;
-                }
-
-                let out_obj: &mut Object = &mut *out;
-                out_obj.set_ivar("rustState", state_ptr as *mut c_void);
-
-                log::info!("[SCK] Adding stream output...");
-                let queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
-                let mut err: id = nil;
-                let ok: bool = msg_send![stream, addStreamOutput: out type: SC_STREAM_OUTPUT_TYPE_SCREEN sampleHandlerQueue: queue error: &mut err];
-                log::info!("[SCK] addStreamOutput result: {}", ok);
-                if !ok {
-                    let desc: id = if err != nil {
-                        msg_send![err, localizedDescription]
-                    } else {
-                        nil
-                    };
-                    let cstr: *const std::os::raw::c_char = if desc != nil {
-                        msg_send![desc, UTF8String]
-                    } else {
-                        std::ptr::null()
-                    };
-                    let s = if !cstr.is_null() {
-                        std::ffi::CStr::from_ptr(cstr).to_string_lossy().to_string()
-                    } else {
-                        "Unknown error".to_string()
-                    };
-                    start_err = Some(format!("SCStream addStreamOutput failed: {s}"));
-                    return;
-                }
-
-                log::info!("[SCK] Starting capture stream...");
-                // Start capture.
-                let sema2 = dispatch_semaphore_create(0);
-                if sema2.is_null() {
-                    start_err = Some("Failed to create semaphore for startCapture".to_string());
-                    return;
-                }
-                let start_error: Arc<Mutex<id>> = Arc::new(Mutex::new(nil));
-                let start_error_cb = start_error.clone();
-                let sema2_cb = sema2;
-                let block2 = ConcreteBlock::new(move |error: id| {
+                    let shareable_cls = class!(SCShareableContent);
                     log::info!(
-                        "[SCK] startCapture completion handler called, error={:?}",
-                        error
+                        "[SCK] SCShareableContent class obtained: {:p}",
+                        shareable_cls
                     );
-                    // Retain error if not nil to prevent it from being deallocated
-                    let retained_error = if error != nil {
-                        let _: id = msg_send![error, retain];
-                        error
-                    } else {
-                        nil
-                    };
-                    if let Ok(mut g) = start_error_cb.lock() {
-                        *g = retained_error;
+
+                    let result: Arc<Mutex<(id, id)>> = Arc::new(Mutex::new((nil, nil)));
+                    let result_cb = result.clone();
+                    let sema_cb = sema;
+
+                    log::info!("[SCK] Creating completion handler block...");
+                    let block = ConcreteBlock::new(move |content: id, error: id| {
+                        // CRITICAL: Retain the Objective-C objects before storing them
+                        // They need to survive beyond the autorelease pool of the callback
+                        let retained_content = if content != nil {
+                            let _: id = msg_send![content, retain];
+                            content
+                        } else {
+                            nil
+                        };
+                        let retained_error = if error != nil {
+                            let _: id = msg_send![error, retain];
+                            error
+                        } else {
+                            nil
+                        };
+
+                        if let Ok(mut g) = result_cb.lock() {
+                            *g = (retained_content, retained_error);
+                        }
+                        unsafe {
+                            dispatch_semaphore_signal(sema_cb);
+                        }
+                    })
+                    .copy();
+                    log::info!(
+                        "[SCK] Block created, calling getShareableContentWithCompletionHandler..."
+                    );
+
+                    let _: () =
+                        msg_send![shareable_cls, getShareableContentWithCompletionHandler: &*block];
+                    log::info!("[SCK] Waiting for shareable content...");
+                    let _ = dispatch_semaphore_wait(sema, DISPATCH_TIME_FOREVER);
+                    log::info!("[SCK] Shareable content received");
+                    let (shareable, shareable_error) = result
+                        .lock()
+                        .ok()
+                        .map(|guard| (guard.0, guard.1))
+                        .unwrap_or((nil, nil));
+
+                    if shareable_error != nil {
+                        let desc: id = msg_send![shareable_error, localizedDescription];
+                        let cstr: *const std::os::raw::c_char = msg_send![desc, UTF8String];
+                        let s = if !cstr.is_null() {
+                            std::ffi::CStr::from_ptr(cstr).to_string_lossy().to_string()
+                        } else {
+                            "Unknown ScreenCaptureKit error".to_string()
+                        };
+                        start_err = Some(format!("ScreenCaptureKit getShareableContent failed: {s}"));
+                        return;
                     }
-                    unsafe {
-                        dispatch_semaphore_signal(sema2_cb);
+                    if shareable == nil {
+                        log::error!("[SCK] Shareable content is nil");
+                        start_err =
+                            Some("ScreenCaptureKit returned null shareable content".to_string());
+                        return;
                     }
-                })
-                .copy();
-                let _: () = msg_send![stream, startCaptureWithCompletionHandler: &*block2];
-                log::info!("[SCK] Waiting for startCapture completion...");
-                let _ = dispatch_semaphore_wait(sema2, DISPATCH_TIME_FOREVER);
-                log::info!("[SCK] startCapture completed");
-                let start_error_obj = start_error.lock().ok().map(|guard| *guard).unwrap_or(nil);
-                if start_error_obj != nil {
-                    let desc: id = msg_send![start_error_obj, localizedDescription];
-                    let cstr: *const std::os::raw::c_char = msg_send![desc, UTF8String];
-                    let s = if !cstr.is_null() {
-                        std::ffi::CStr::from_ptr(cstr).to_string_lossy().to_string()
+
+                    log::info!("[SCK] Shareable content valid, fetching displays...");
+                    let displays: id = msg_send![shareable, displays];
+                    if displays == nil {
+                        start_err =
+                            Some("ScreenCaptureKit shareable content has no displays".to_string());
+                        return;
+                    }
+
+                    let count: NSUInteger = msg_send![displays, count];
+                    log::info!("[SCK] Found {} displays", count);
+                    let mut target_display: id = nil;
+                    for i in 0..count {
+                        let d: id = msg_send![displays, objectAtIndex: i];
+                        if d == nil {
+                            continue;
+                        }
+                        let did: u32 = msg_send![d, displayID];
+                        if did == main_display_id {
+                            log::info!("[SCK] Found main display: {}", did);
+                            target_display = d;
+                            break;
+                        }
+                    }
+                    if target_display == nil {
+                        log::error!(
+                            "[SCK] Main display {} not found in shareable displays",
+                            main_display_id
+                        );
+                        start_err = Some("ScreenCaptureKit could not find main display".to_string());
+                        return;
+                    }
+
+                    log::info!("[SCK] Creating content filter...");
+                    // Create filter and config with exclusion list
+                    let excluding_windows =
+                        build_excluding_windows_array(&excluded_for_closure, shareable);
+                    let filter: id = msg_send![class!(SCContentFilter), alloc];
+                    let filter: id = msg_send![filter, initWithDisplay: target_display excludingWindows: excluding_windows];
+                    if filter == nil {
+                        start_err = Some("Failed to create SCContentFilter".to_string());
+                        return;
+                    }
+
+                    // Ensure display info is initialized (required for correct sizing).
+                    if !crate::display_info::is_initialized() {
+                        log::warn!("[SCK] DisplayInfo not initialized, initializing on main thread...");
+                        if let Err(e) = crate::display_info::initialize() {
+                            start_err = Some(format!("Failed to initialize display info: {e}"));
+                            return;
+                        }
+                    }
+
+                    let state_ref = &*(state_ptr);
+                    state_ref.show_cursor.store(show_cursor_local, Ordering::Relaxed);
+
+                    // Prefer a GPU-side crop: the compositor delivers only the region
+                    // (sourceRect, in display points) instead of the full display.
+                    let initial_region = if use_source_rect {
+                        Some(state_ref.region_points())
                     } else {
-                        "Unknown error".to_string()
+                        None
                     };
-                    log::error!("[SCK] ❌ startCapture FAILED: {}", s);
+                    log::info!(
+                        "[SCK] Stream config: sourceRect={:?}, fps={}",
+                        initial_region,
+                        state_ref.fps.load(Ordering::Relaxed)
+                    );
+                    let cfg = build_config(state_ref, initial_region);
+                    if cfg == nil {
+                        start_err = Some("Failed to create SCStreamConfiguration".to_string());
+                        return;
+                    }
 
-                    // Release the retained error
-                    let _: () = msg_send![start_error_obj, release];
+                    log::info!("[SCK] Creating SCStream...");
+                    let stream: id = msg_send![class!(SCStream), alloc];
+                    let stream: id =
+                        msg_send![stream, initWithFilter: filter configuration: cfg delegate: nil];
+                    if stream == nil {
+                        log::error!("[SCK] Failed to create SCStream");
+                        start_err = Some("Failed to create SCStream".to_string());
+                        return;
+                    }
+                    log::info!("[SCK] SCStream created successfully");
 
-                    start_err = Some(format!("SCStream startCapture failed: {s}"));
-                    return;
-                }
+                    let out_cls = ensure_output_class();
+                    if out_cls.is_null() {
+                        start_err = Some("Failed to create SCStreamOutput class".to_string());
+                        return;
+                    }
+                    let out: id = msg_send![out_cls, new];
+                    if out == nil {
+                        start_err = Some("Failed to create SCStreamOutput instance".to_string());
+                        return;
+                    }
 
-                log::info!("[SCK] Stream started successfully!");
-                created_stream = Some(StrongPtr::new(stream));
-                created_output = Some(StrongPtr::new(out));
+                    let out_obj: &mut Object = &mut *out;
+                    out_obj.set_ivar("rustState", state_ptr as *mut c_void);
 
-                // Release the retained objects from completion handler
-                if shareable != nil {
-                    let _: () = msg_send![shareable, release];
-                }
-                if shareable_error != nil {
-                    let _: () = msg_send![shareable_error, release];
-                }
+                    log::info!("[SCK] Adding stream output...");
+                    let queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
+                    let mut err: id = nil;
+                    let ok: bool = msg_send![stream, addStreamOutput: out type: SC_STREAM_OUTPUT_TYPE_SCREEN sampleHandlerQueue: queue error: &mut err];
+                    log::info!("[SCK] addStreamOutput result: {}", ok);
+                    if !ok {
+                        let desc: id = if err != nil {
+                            msg_send![err, localizedDescription]
+                        } else {
+                            nil
+                        };
+                        let cstr: *const std::os::raw::c_char = if desc != nil {
+                            msg_send![desc, UTF8String]
+                        } else {
+                            std::ptr::null()
+                        };
+                        let s = if !cstr.is_null() {
+                            std::ffi::CStr::from_ptr(cstr).to_string_lossy().to_string()
+                        } else {
+                            "Unknown error".to_string()
+                        };
+                        start_err = Some(format!("SCStream addStreamOutput failed: {s}"));
+                        return;
+                    }
+
+                    log::info!("[SCK] Starting capture stream...");
+                    // Start capture.
+                    let sema2 = dispatch_semaphore_create(0);
+                    if sema2.is_null() {
+                        start_err = Some("Failed to create semaphore for startCapture".to_string());
+                        return;
+                    }
+                    let start_error: Arc<Mutex<id>> = Arc::new(Mutex::new(nil));
+                    let start_error_cb = start_error.clone();
+                    let sema2_cb = sema2;
+                    let block2 = ConcreteBlock::new(move |error: id| {
+                        log::info!(
+                            "[SCK] startCapture completion handler called, error={:?}",
+                            error
+                        );
+                        // Retain error if not nil to prevent it from being deallocated
+                        let retained_error = if error != nil {
+                            let _: id = msg_send![error, retain];
+                            error
+                        } else {
+                            nil
+                        };
+                        if let Ok(mut g) = start_error_cb.lock() {
+                            *g = retained_error;
+                        }
+                        unsafe {
+                            dispatch_semaphore_signal(sema2_cb);
+                        }
+                    })
+                    .copy();
+                    let _: () = msg_send![stream, startCaptureWithCompletionHandler: &*block2];
+                    log::info!("[SCK] Waiting for startCapture completion...");
+                    let _ = dispatch_semaphore_wait(sema2, DISPATCH_TIME_FOREVER);
+                    log::info!("[SCK] startCapture completed");
+                    let start_error_obj = start_error.lock().ok().map(|guard| *guard).unwrap_or(nil);
+                    if start_error_obj != nil {
+                        let desc: id = msg_send![start_error_obj, localizedDescription];
+                        let cstr: *const std::os::raw::c_char = msg_send![desc, UTF8String];
+                        let s = if !cstr.is_null() {
+                            std::ffi::CStr::from_ptr(cstr).to_string_lossy().to_string()
+                        } else {
+                            "Unknown error".to_string()
+                        };
+                        log::error!("[SCK] ❌ startCapture FAILED: {}", s);
+
+                        // Release the retained error
+                        let _: () = msg_send![start_error_obj, release];
+
+                        start_err = Some(format!("SCStream startCapture failed: {s}"));
+                        return;
+                    }
+
+                    log::info!("[SCK] Stream started successfully!");
+                    state_ref.source_rect_active.store(initial_region.is_some(), Ordering::Release);
+                    if let Ok(mut g) = state_ref.applied_region.lock() {
+                        *g = initial_region;
+                    }
+                    created_stream = Some(StrongPtr::new(stream));
+                    created_output = Some(StrongPtr::new(out));
+
+                    // Release the retained objects from completion handler
+                    if shareable != nil {
+                        let _: () = msg_send![shareable, release];
+                    }
+                    if shareable_error != nil {
+                        let _: () = msg_send![shareable_error, release];
+                    }
+                });
             });
-        });
+            if start_err.is_none() || !use_source_rect {
+                break;
+            }
+            log::warn!(
+                "[SCK] Start with sourceRect failed ({:?}); retrying with full-display capture",
+                start_err
+            );
+            self.state.source_rect_disabled.store(true, Ordering::Release);
+        }
 
         if let Some(err) = start_err {
             log::error!("[SCK] start() failed: {}", err);
@@ -1099,8 +1330,54 @@ impl ScreenCaptureKitCapture {
         });
     }
 
-    pub fn latest_frame_rgba(&self) -> Option<(Vec<u8>, u32, u32, u64)> {
-        self.state.get()
+    /// Move the latest frame out without copying it.
+    pub fn take_latest_frame_rgba(&self) -> Option<(Vec<u8>, u32, u32, u64)> {
+        self.state.take()
+    }
+
+    /// Frame delivery options; fps applies to the next start / config update.
+    pub fn set_frame_options(&self, fps: u32, skip_unchanged: bool) {
+        self.state.fps.store(fps.clamp(1, 240), Ordering::Relaxed);
+        self.state.skip_unchanged.store(skip_unchanged, Ordering::Relaxed);
+    }
+
+    /// Keep the stream's sourceRect in sync with the region. Non-blocking:
+    /// at most one configuration update is in flight; the latest region wins.
+    pub fn sync_stream_config(&self) {
+        let Some(stream) = self.stream.as_ref() else {
+            return;
+        };
+        let state = &self.state;
+        let want = if state.source_rect_disabled.load(Ordering::Acquire) {
+            None
+        } else {
+            Some(state.region_points())
+        };
+        let applied = state.applied_region.lock().ok().and_then(|g| *g);
+        if want == applied {
+            return;
+        }
+        if state
+            .config_inflight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let stream: id = **stream;
+        let ctx = Box::new(ConfigUpdate {
+            stream: unsafe { msg_send![stream, retain] },
+            state: state.clone(),
+            region: want,
+        });
+        // Async so neither the render thread nor the caller blocks on main.
+        unsafe {
+            dispatch_async_f(
+                &_dispatch_main_q as *const c_void,
+                Box::into_raw(ctx) as *mut c_void,
+                apply_config_update,
+            );
+        }
     }
 
     pub fn latest_iosurface(
